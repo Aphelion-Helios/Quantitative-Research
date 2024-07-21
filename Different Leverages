@@ -1,0 +1,15 @@
+# different leverages
+KDA_100 <- KDA(rets, leverageFactor = 1)
+KDA_EW <- KDA(rets, leverageFactor = 1, momWeights = c(1,1,1,1))
+KDA_rev <- KDA(rets, leverageFactor = 1, momWeights = c(1, 2, 4, 12))
+# KDA_150 <- KDA(rets, leverageFactor = 1.5)
+# KDA_200 <- KDA(rets, leverageFactor = 2)
+
+# compare
+compare <- na.omit(cbind(KDA_100[[2]], KDA_EW[[2]], KDA_rev[[2]]))
+colnames(compare) <- c("KDA_base", "KDA_EW", "KDA_rev")
+charts.PerformanceSummary(compare, colorset = c('black', 'purple', 'gold'),
+                          main = "KDA AA with various momentum weights")
+
+stratStats(compare)
+apply.yearly(compare, Return.cumulative)
