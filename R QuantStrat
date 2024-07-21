@@ -1,0 +1,330 @@
+require(PerformanceAnalytics)
+require(quantmod)
+require(tseries)
+require(quadprog)
+
+stratStats <- function(rets) {
+  stats <- rbind(table.AnnualizedReturns(rets), maxDrawdown(rets))
+  stats[5,] <- stats[1,]/stats[4,]
+  stats[6,] <- stats[1,]/UlcerIndex(rets)
+  rownames(stats)[4] <- "Worst Drawdown"
+  rownames(stats)[5] <- "Calmar Ratio"
+  rownames(stats)[6] <- "Ulcer Performance Index"
+  return(stats)
+}
+
+
+getYahooReturns <- function(symbols, return_column = "Ad") {
+  returns <- list()
+  for(symbol in symbols) {
+    getSymbols(symbol, from = '1990-01-01', adjustOHLC = TRUE)
+    if(return_column == "Ad") {
+      return <- Return.calculate(Ad(get(symbol)))
+      colnames(return) <- gsub("\\.Adjusted", "", colnames(return))
+    } else {
+      return <- Return.calculate(Op(get(symbol)))
+      colnames(return) <- gsub("\\.Open", "", colnames(return))
+
+    }
+    returns[[symbol]] <- return
+  }
+  returns <- na.omit(do.call(cbind, returns))
+  return(returns)
+}
+
+symbols <- c("SPY", "VGK",   "EWJ",  "EEM",  "VNQ",  "RWX",  "IEF",  "TLT",  "DBC",  "GLD")
+
+returns <- getYahooReturns(symbols)
+canary <- getYahooReturns(c("VWO", "BND"))
+
+# offsets endpoints by a certain amount of days (I.E. 1-21)
+dailyOffset <- function(ep, offset = 0) {
+
+  ep <- ep + offset
+  ep[ep < 1] <- 1
+  ep[ep > nrow(returns)] <- nrow(returns)
+  ep <- unique(ep)
+  epDiff <- diff(ep)
+  if(last(epDiff)==1) {
+    # if the last period only has one observation, remove it
+    ep <- ep[-length(ep)]
+  }
+  return(ep)
+}
+
+# computes total weighted momentum and penalizes new assets (if desired)
+compute_total_momentum <- function(yearly_subset,
+                                   momentum_lookbacks, momentum_weights,
+                                   old_weights, new_asset_mom_penalty) {
+
+  empty_vec <- data.frame(t(rep(0, ncol(yearly_subset))))
+  colnames(empty_vec) <- colnames(yearly_subset)
+
+  total_momentum <- empty_vec
+  for(j in 1:length(momentum_lookbacks)) {
+    momentum_subset <- tail(yearly_subset, momentum_lookbacks[j])
+    total_momentum <- total_momentum + Return.cumulative(momentum_subset) *
+      momentum_weights[j]
+  }
+
+  # if asset returns are negative, penalize by *increasing* negative momentum
+  # this algorithm assumes we go long only
+  total_momentum[old_weights == 0] <- total_momentum[old_weights==0] *
+    (1-new_asset_mom_penalty * sign(total_momentum[old_weights==0]))
+
+  return(total_momentum)
+}
+
+# compute weighted correlation matrix
+compute_total_correlation <- function(data, cor_lookbacks, cor_weights) {
+
+  # compute total correlation matrix
+  total_cor <- matrix(nrow=ncol(data), ncol=ncol(data), 0)
+  rownames(total_cor) <- colnames(total_cor) <- colnames(data)
+  for(j in 1:length(cor_lookbacks)) {
+    total_cor = total_cor + cor(tail(data, cor_lookbacks[j])) * cor_weights[j]
+  }
+
+  return(total_cor)
+}
+
+# computes total weighted volatility
+compute_total_volatility <- function(data, vol_lookbacks, vol_weights) {
+  empty_vec <- data.frame(t(rep(0, ncol(data))))
+  colnames(empty_vec) <- colnames(data)
+
+  # normalize weights if not already normalized
+  if(sum(vol_weights) != 1) {
+    vol_weights <- vol_weights/sum(vol_weights)
+  }
+
+  # compute total volrelation matrix
+  total_vol <- empty_vec
+  for(j in 1:length(vol_lookbacks)) {
+    total_vol = total_vol + StdDev.annualized(tail(data, vol_lookbacks[j])) * vol_weights[j]
+  }
+
+  return(total_vol)
+}
+
+check_valid_parameters <- function(mom_lookbacks, cor_lookbacks, mom_weights, cor_weights, vol_weights, vol_lookbacks) {
+  if(length(mom_weights) != length(mom_lookbacks)) {
+    stop("Momentum weight length must be equal to momentum lookback length.") }
+
+  if(length(cor_weights) != length(cor_lookbacks)) {
+    stop("Correlation weight length must be equal to correlation lookback length.")
+  }
+
+  if(length(vol_weights) != length(vol_lookbacks)) {
+    stop("Volatility weight length must be equal to volatility lookback length.")
+  }
+}
+
+
+# computes weights as a function proportional to the inverse of total variance
+invVar <- function(returns, lookbacks, lookback_weights) {
+  var <- compute_total_volatility(returns, lookbacks, lookback_weights)^2
+  invVar <- 1/var
+  return(invVar/sum(invVar))
+}
+
+# computes weights as a function proportional to the inverse of total volatility
+invVol <- function(returns, lookbacks, lookback_weights) {
+  vol <- compute_total_volatility(returns, lookbacks, lookback_weights)
+  invVol <- 1/vol
+  return(invVol/sum(invVol))
+}
+
+# computes equal weight portfolio
+ew <- function(returns) {
+  return(StdDev(returns)/(StdDev(returns)*ncol(returns)))
+}
+
+# computes minimum volatility portfolio
+minVol <- function(returns, cor_lookbacks, cor_weights, vol_lookbacks, vol_weights) {
+  vols <- compute_total_volatility(returns, vol_lookbacks, vol_weights)
+  cors <- compute_total_correlation(returns, cor_lookbacks, cor_weights)
+  covs <- t(vols) %*% as.numeric(vols) * cors
+  min_vol_rets <- t(matrix(rep(1, ncol(covs))))
+
+  n.col = ncol(covs)
+  zero.mat <- array(0, dim = c(n.col, 1))
+  one.zero.diagonal.a <- cbind(1, diag(n.col), 1 * diag(n.col), -1 * diag(n.col))
+  min.wgt <- rep(0, n.col)
+  max.wgt <- rep(1, n.col)
+  bvec.1.vector.a <- c(1, rep(0, n.col), min.wgt, -max.wgt)
+  meq.1 <- 1
+
+  mv.port.noshort.a <- solve.QP(Dmat = covs, dvec = zero.mat, Amat = one.zero.diagonal.a,
+                                bvec = bvec.1.vector.a, meq = meq.1)
+
+
+  min_vol_wt <- mv.port.noshort.a$solution
+  names(min_vol_wt) <- rownames(covs)
+  return(min_vol_wt)
+}
+asset_allocator <- function(returns,
+                           canary_returns = NULL, # canary assets for KDA algorithm and similar
+
+                           mom_threshold = 0, # threshold momentum must exceed
+                           mom_lookbacks = 126, # momentum lookbacks for custom weights (EG 1-3-6-12)
+
+                           # weights on various momentum lookbacks (EG 12/19, 4/19, 2/19, 1/19)
+                           mom_weights = rep(1/length(mom_lookbacks),
+                                             length(mom_lookbacks)),
+
+                           # repeat for correlation weights
+                           cor_lookbacks = mom_lookbacks, # correlation lookback
+                           cor_weights = rep(1/length(mom_lookbacks),
+                                             length(mom_lookbacks)),
+
+                           vol_lookbacks = 20, # volatility lookback
+                           vol_weights = rep(1/length(vol_lookbacks),
+                                             length(vol_lookbacks)),
+
+                           # number of assets to hold (if all above threshold)
+                           top_n = floor(ncol(returns)/2),
+
+                           # diversification weight scheme (ew, invVol, invVar, minVol, etc.)
+                           weight_scheme = "minVol",
+
+                           # how often holdings rebalance
+                           rebalance_on = "months",
+
+                           # how many days to offset rebalance period from end of month/quarter/year
+                           offset = 0,
+
+                           # penalize new asset mom to reduce turnover
+                           new_asset_mom_penalty = 0,
+
+                           # run Return.Portfolio, or just return weights?
+                           # for use in robust momentum type portfolios
+                           compute_portfolio_returns = TRUE,
+                           verbose = FALSE,
+
+                           # crash protection asset
+                           crash_asset = NULL,
+                           ...
+                           ) {
+
+  # normalize weights
+  mom_weights <- mom_weights/sum(mom_weights)
+  cor_weights <- cor_weights/sum(cor_weights)
+  vol_weights <- vol_weights/sum(vol_weights)
+
+  # if we have canary returns (I.E. KDA strat), align both time periods
+  if(!is.null(canary_returns)) {
+   smush <- na.omit(cbind(returns, canary_returns))
+   returns <- smush[,1:ncol(returns)]
+   canary_returns <- smush[,-c(1:ncol(returns))]
+   empty_canary_vec <- data.frame(t(rep(0, ncol(canary_returns))))
+   colnames(empty_canary_vec) <- colnames(canary_returns)
+  }
+
+  # get endpoints and offset them
+  ep <- endpoints(returns, on = rebalance_on)
+  ep <- dailyOffset(ep, offset = offset)
+
+  # initialize vector holding zeroes for assets
+  empty_vec <- data.frame(t(rep(0, ncol(returns))))
+  colnames(empty_vec) <- colnames(returns)
+  weights <- empty_vec
+
+  # initialize list to hold all our weights
+  all_weights <- list()
+
+  # get number of periods per year
+  switch(rebalance_on,
+         "months" = { yearly_periods = 12},
+         "quarters" = { yearly_periods = 4},
+         "years" = { yearly_periods = 1})
+
+  for(i in 1:(length(ep) - yearly_periods)) {
+
+    # remember old weights for the purposes of penalizing momentum of new assets
+    old_weights <- weights
+
+    # subset one year of returns, leave off first day
+    return_subset <- returns[c((ep[i]+1):ep[(i+yearly_periods)]),]
+
+    # compute total weighted momentum, penalize potential new assets if desired
+    momentums <- compute_total_momentum(return_subset,
+                                        momentum_lookbacks = mom_lookbacks,
+                                        momentum_weights = mom_weights,
+                                        old_weights = old_weights,
+                                        new_asset_mom_penalty = new_asset_mom_penalty)
+
+    # rank negative momentum so that best asset is ranked 1 and so on
+    momentum_ranks <- rank(-momentums)
+    selected_assets <- momentum_ranks <= top_n & momentums > mom_threshold
+    selected_subset <- return_subset[, selected_assets]
+
+    # case of 0 valid assets
+    if(sum(selected_assets)==0) {
+      weights <- empty_vec
+    } else if (sum(selected_assets)==1) {
+
+      # case of only 1 valid asset -- invest everything into it
+      weights <- empty_vec + selected_assets
+
+    } else {
+      # apply a user-selected weighting algorithm
+      # modify this portion to select more weighting schemes
+      if (weight_scheme == "ew") {
+        weights <- ew(selected_subset)
+      } else if (weight_scheme == "invVol") {
+        weights <- invVol(selected_subset, vol_lookbacks, vol_weights)
+      } else if (weight_scheme == "invVar"){
+        weights <- invVar(selected_subset, vol_lookbacks, vol_weights)
+      } else if (weight_scheme == "minVol") {
+        weights <- minVol(selected_subset, cor_lookbacks, cor_weights,
+                          vol_lookbacks, vol_weights)
+      }
+    }
+
+    # include all assets
+    wt_names <- names(weights)
+    if(is.null(wt_names)){wt_names <- colnames(weights)}
+    zero_weights <- empty_vec
+    zero_weights[wt_names] <- weights
+    weights <- zero_weights
+    weights <- xts(weights, order.by=last(index(return_subset)))
+
+    # if there's a canary universe, modify weights by fraction with positive momentum
+    # if there's a safety asset, allocate the crash protection modifier to it.
+    if(!is.null(canary_returns)) {
+      canary_subset <- canary_returns[c(ep[i]:ep[(i+yearly_periods)]),]
+      canary_subset <- canary_subset[-1,]
+      canary_mom <- compute_total_momentum(canary_subset,
+                                           mom_lookbacks, mom_weights,
+                                           empty_canary_vec, 0)
+      canary_mod <- mean(canary_mom > 0)
+      weights <- weights * canary_mod
+      if(!is.null(crash_asset)) {
+        if(momentums[crash_asset] > mom_threshold) {
+          weights[,crash_asset] <- weights[,crash_asset] + (1-canary_mod)
+        }
+      }
+    }
+
+    all_weights[[i]] <- weights
+  }
+
+  # combine weights
+  all_weights <- do.call(rbind, all_weights)
+  if(compute_portfolio_returns) {
+    strategy_returns <- Return.portfolio(R = returns, weights = all_weights, verbose = verbose)
+    return(list(all_weights, strategy_returns))
+  }
+  return(all_weights)
+
+}
+
+#out <- asset_allocator(returns, offset = 0)
+kda <- asset_allocator(returns = returns, canary_returns = canary,
+                       mom_lookbacks = c(21, 63, 126, 252),
+                       mom_weights = c(12, 4, 2, 1),
+                       cor_lookbacks = c(21, 63, 126, 252),
+                       cor_weights = c(12, 4, 2, 1), vol_lookbacks = 21,
+                       weight_scheme = "minVol",
+                       crash_asset = "IEF")
