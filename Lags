@@ -1,0 +1,13 @@
+lagCompare <- list()
+for(i in 1:21) {
+  offRets <- KDA(rets, leverageFactor = 1, offset = i)
+  tmp <- offRets[[2]]
+  colnames(tmp) <- paste0("Lag", i)
+  lagCompare[[i]] <- tmp
+}
+lagCompare <- do.call(cbind, lagCompare)
+lagCompare <- na.omit(cbind(KDA_100[[2]], lagCompare))
+colnames(lagCompare)[1] <- "Base"
+
+charts.PerformanceSummary(lagCompare, colorset=c("orange", rep("gray", 21)))
+stratStats(lagCompare)
