@@ -1,0 +1,22 @@
+# computes total weighted momentum and penalizes new assets (if desired)
+compute_total_momentum <- function(yearly_subset,
+                                   momentum_lookbacks, momentum_weights,
+                                   old_weights, new_asset_mom_penalty) {
+
+  empty_vec <- data.frame(t(rep(0, ncol(yearly_subset))))
+  colnames(empty_vec) <- colnames(yearly_subset)
+
+  total_momentum <- empty_vec
+  for(j in 1:length(momentum_lookbacks)) {
+    momentum_subset <- tail(yearly_subset, momentum_lookbacks[j])
+    total_momentum <- total_momentum + Return.cumulative(momentum_subset) *
+      momentum_weights[j]
+  }
+
+  # if asset returns are negative, penalize by *increasing* negative momentum
+  # this algorithm assumes we go long only
+  total_momentum[old_weights == 0] <- total_momentum[old_weights==0] *
+    (1-new_asset_mom_penalty * sign(total_momentum[old_weights==0]))
+
+  return(total_momentum)
+}
